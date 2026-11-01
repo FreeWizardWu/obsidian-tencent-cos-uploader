@@ -1,0 +1,12 @@
+node_modules/
+main.js
+*.log
+.DS_Store
+
+# 插件运行时配置：里面有明文 SecretId / SecretKey，绝对不能提交
+data.json
+data.json.bak-*
+*.bak-*
+
+# 发布产物（由 npm run release 生成并附到 GitHub Release）
+release/
