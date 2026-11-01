@@ -18,7 +18,7 @@
  *   npm run release -- --dry   # 只构建+校验，不提交不发布
  */
 import { execSync } from 'child_process';
-import { existsSync, mkdirSync, copyFileSync, readFileSync } from 'fs';
+import { existsSync, mkdirSync, copyFileSync, readFileSync, writeFileSync } from 'fs';
 import path from 'path';
 
 const DRY_RUN = process.argv.includes('--dry');
@@ -115,11 +115,11 @@ const notes = `## ${version}
 
 安装（BRAT）：BRAT → Add Beta Plugin → 填入本仓库路径。`;
 
-run(
-    `gh release create ${tag} ${ASSETS.join(' ')} ` +
-        `--title ${tag} ` +
-        `--notes ${JSON.stringify(notes)}`
-);
+// 用文件传 notes，避免命令行转义把 \n 当成字面量
+const notesFile = path.join(outDir, 'RELEASE_NOTES.md');
+writeFileSync(notesFile, notes, 'utf8');
+
+run(`gh release create ${tag} ${ASSETS.join(' ')} --title ${tag} --notes-file ${notesFile}`);
 
 console.log(`\n完成：https://github.com/${runQuiet('gh repo view --json nameWithOwner -q .nameWithOwner')}/releases/tag/${tag}`);
 console.log('BRAT 里的仓库路径就是上面的 用户名/仓库名。');
