@@ -106,14 +106,24 @@ run(`git push origin ${tag}`);
 
 /* ---------------------------- 4. 创建 Release ---------------------------- */
 
-const notes = `## 1.3.1
+const notes = `## 1.4.0
 
-### 变更
-- 设置页与 README 里的示例值改为通用示例（1250000000 / my-bucket-1250000000），不再使用真实 App ID 与桶名
-- 说明：设置页里灰色的 AKIDxxxx… 只是**占位提示**，不是已填内容；实际值只来自 data.json
+### 修复：手机端点「开始上传」后完全没有反馈
+- 预检弹窗之前把进度 Notice hide() 掉了，之后又往这个已隐藏的 Notice 里 setMessage，永远不会重新显示
+- 手机端 Obsidian 没有状态栏，状态栏进度也看不见，于是变成完全零反馈
+- 现在弹窗确认后会重建进度 Notice，并在 Notice 里内嵌「取消」按钮（手机端也能取消）
 
-### 注意
-- 插件本体不包含任何密钥。手机端首次使用需自己填写 SecretId / SecretKey / Bucket / Region`;
+### 修复：上传进度卡住不动
+- 单张图片加总预算（默认 60 秒，含所有重试与备用通道），超了直接判失败，不再让一张图拖住整轮
+- 任务超时后真正 abort 底层请求（每个任务独立 AbortController），不再后台空转
+- 进度提示里增加「已 N 秒没有新完成，正在处理: xxx」，能区分慢和卡死
+
+### 新增：诊断日志
+- 命令面板 → Export diagnostics log：最近 800 条日志写入插件目录 diagnostics.log 并复制到剪贴板
+- 记录每张图片走的下载通道（requestUrl / 代理 / 直连）、耗时、COS 请求状态与失败原因
+
+### 其他
+- 设置页与 README 的示例值改为通用示例，不再使用真实 App ID / 桶名`;
 
 // 用文件传 notes，避免命令行转义把 \n 当成字面量
 const notesFile = path.join(outDir, 'RELEASE_NOTES.md');

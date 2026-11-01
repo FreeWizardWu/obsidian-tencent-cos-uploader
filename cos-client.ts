@@ -11,6 +11,7 @@
 
 import { requestUrl } from 'obsidian';
 import { hmacSha256, sha256Hex, toHex, utf8Bytes } from './hash';
+import { logInfo, logWarn } from './logger';
 import { TencentCOSUploaderSettings } from './settings';
 
 const ALGORITHM = 'TC3-HMAC-SHA256';
@@ -139,7 +140,7 @@ export class COSClient {
             await this.request({ method: 'DELETE', key }, signal);
         } catch (error) {
             if (isCancelled(error)) throw error;
-            console.warn('[COS Uploader] 删除临时对象失败（可忽略）:', error);
+            logWarn('删除临时对象失败（可忽略）', error);
         }
     }
 
@@ -194,7 +195,15 @@ export class COSClient {
         delete requestHeaders.host;
 
         const timeoutMs = clampTimeout(settings.timeoutMs);
-        return this.send(url, init.method, requestHeaders, init.method === 'PUT' ? body : undefined, timeoutMs, signal);
+        return this.send(
+            url,
+            init.method,
+            requestHeaders,
+            init.method === 'PUT' ? body : undefined,
+            timeoutMs,
+            signal,
+            init.key
+        );
     }
 
     /**
@@ -212,7 +221,8 @@ export class COSClient {
         headers: Record<string, string>,
         body: Uint8Array | undefined,
         timeoutMs: number,
-        signal?: AbortSignal
+        signal: AbortSignal | undefined,
+        keyForLog: string
     ): Promise<COSResponse> {
         const payload = body ? toArrayBuffer(body) : undefined;
         const attempts = 2;
@@ -222,8 +232,16 @@ export class COSClient {
             if (signal?.aborted) throw cancelledError();
 
             try {
+                const startedAt = Date.now();
                 const response = await this.sendOnce(url, method, headers, payload, timeoutMs, signal);
-                if (response.status >= 200 && response.status < 300) return response;
+                if (response.status >= 200 && response.status < 300) {
+                    logInfo(`COS ${method} 成功`, {
+                        key: keyForLog,
+                        ms: Date.now() - startedAt,
+                        bytes: payload ? payload.byteLength : 0,
+                    });
+                    return response;
+                }
 
                 const error = new COSRequestError(describeCosError(response), response.status);
                 // 4xx 重试也没用（密钥、权限、桶名问题），直接报错
@@ -233,7 +251,7 @@ export class COSClient {
                 if (isCancelled(error) || signal?.aborted) throw cancelledError();
                 if (error instanceof COSRequestError && error.status < 500) throw error;
                 lastError = error instanceof Error ? error : new Error(String(error));
-                console.warn(`[COS Uploader] ${method} 第 ${attempt} 次失败：${lastError.message}`);
+                logWarn(`COS ${method} 第 ${attempt} 次失败`, { key: keyForLog, error: lastError.message });
             }
 
             if (attempt < attempts) await sleep(400 * attempt);
@@ -264,7 +282,7 @@ export class COSClient {
         } catch (error) {
             // 超时 / 取消要往上抛，不要拿 fetch 再试一遍
             if (isCancelled(error) || isTimeout(error)) throw error;
-            console.warn('[COS Uploader] requestUrl 失败，尝试 fetch 回退:', error);
+            logWarn('requestUrl 失败，改用 fetch 回退', error);
             return fetchRequest(url, method, headers, payload, timeoutMs, signal);
         }
     }

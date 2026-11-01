@@ -569,4 +569,27 @@ await testAsync('headObject 遇到取消会抛出，不会被当成「对象不�
     await assert.rejects(() => client.headObject('a.png', controller.signal), /已取消/);
 });
 
+console.log('回归：手机端无反馈的 bug');
+
+test('预检弹窗之后必须重建 Notice（hide() 之后 setMessage 不会重新显示）', async () => {
+    const { readFileSync } = await import('fs');
+    const source = readFileSync('main.ts', 'utf8');
+
+    const modalCall = source.indexOf('openAndWait()');
+    assert.ok(modalCall > 0, '找不到预检弹窗调用');
+
+    // 弹窗确认之后 600 字以内必须出现 new Notice(...)，否则进度提示永远不会显示
+    const after = source.slice(modalCall, modalCall + 600);
+    assert.ok(
+        /notice = new Notice\(/.test(after),
+        '预检弹窗之后没有重建 Notice：hide() 掉的 Notice 用 setMessage 是显示不出来的（手机端会完全没有进度反馈）'
+    );
+});
+
+test('每个任务都有自己的 AbortController，超时能真正中断请求', async () => {
+    const { readFileSync } = await import('fs');
+    const source = readFileSync('main.ts', 'utf8');
+    assert.ok(/new AbortController\(\)/.test(source), '任务级 AbortController 丢失');
+    assert.ok(/controller\.abort\(\)/.test(source), '超时后没有 abort 底层请求');
+});
 console.log(`\n${passed} 项通过${process.exitCode ? '，存在失败项' : ''}`);

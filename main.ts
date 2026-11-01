@@ -4,6 +4,7 @@ import { TencentCOSUploaderSettingTab } from './settings-tab';
 import { ImageDownloader, DownloadOptions } from './downloader';
 import { COSUploader } from './cos-uploader';
 import { PreflightModal, PreflightSummary } from './preflight-modal';
+import { getLogText, logError, logInfo, logWarn } from './logger';
 import {
     parseImageLinks,
     replaceImageTargets,
@@ -89,6 +90,18 @@ export default class TencentCOSUploaderPlugin extends Plugin {
             },
         });
 
+        logInfo('插件加载', {
+            version: this.manifest.version,
+            platform: Platform.isDesktopApp ? 'desktop' : 'mobile',
+            bucket: this.settings.bucket ? '已配置' : '未配置',
+        });
+
+        this.addCommand({
+            id: 'export-diagnostics',
+            name: 'Export diagnostics log',
+            callback: () => void this.exportDiagnostics(),
+        });
+
         this.addCommand({
             id: 'test-cos-connection',
             name: 'Test COS connection',
@@ -155,7 +168,7 @@ export default class TencentCOSUploaderPlugin extends Plugin {
 
         if (missing.length > 0) {
             new Notice(`COS 配置不完整，缺少：${missing.join('、')}。请到插件设置中补齐。`, 8000);
-            console.error('[COS Uploader] 配置缺失:', missing);
+            logError('配置缺失', missing);
             return false;
         }
         return true;
@@ -167,6 +180,8 @@ export default class TencentCOSUploaderPlugin extends Plugin {
             proxyUrl: this.settings.proxyUrl,
             referer: this.settings.referer,
             timeoutMs: this.settings.timeoutMs,
+            // 单张图片总预算：超过这个时间就判定失败，不让一张图拖住整轮
+            budgetMs: Math.min(Math.max(this.settings.timeoutMs * 2, 30000), 180000),
             retries: this.settings.retries,
             maxBytes: 80 * 1024 * 1024,
             preferObsidianRequest: this.settings.preferObsidianRequest,
@@ -197,6 +212,40 @@ export default class TencentCOSUploaderPlugin extends Plugin {
             const message = error instanceof Error ? error.message : String(error);
             notice.setMessage(`连接失败：${message}`);
             setTimeout(() => notice.hide(), 10000);
+        }
+    }
+
+    /**
+     * 导出诊断日志到插件目录，并尽量复制到剪贴板。
+     * 手机端看不到控制台，出问题时用这个把日志拿出来。
+     */
+    async exportDiagnostics(): Promise<void> {
+        const text = [
+            `# COS Uploader 诊断日志`,
+            `时间: ${new Date().toISOString()}`,
+            `插件版本: ${this.manifest.version}`,
+            `平台: ${Platform.isDesktopApp ? 'desktop' : 'mobile'}`,
+            `Obsidian: ${(this.app as unknown as { appVersion?: string }).appVersion || 'unknown'}`,
+            `Bucket: ${this.settings.bucket || '(未配置)'} / ${this.settings.region || '(未配置)'}`,
+            `并发: ${this.settings.concurrency} · 超时: ${this.settings.timeoutMs}ms · 重试: ${this.settings.retries}`,
+            '',
+            getLogText(),
+            '',
+        ].join('\n');
+
+        const dir = this.manifest.dir || `.obsidian/plugins/${this.manifest.id}`;
+        const filePath = `${dir}/diagnostics.log`;
+        try {
+            await this.app.vault.adapter.write(filePath, text);
+        } catch (error) {
+            logWarn('写入诊断日志失败', error);
+        }
+
+        try {
+            await navigator.clipboard.writeText(text);
+            new Notice(`诊断日志已复制到剪贴板，同时保存到 ${filePath}`, 10000);
+        } catch {
+            new Notice(`诊断日志已保存到 ${filePath}`, 10000);
         }
     }
 
@@ -239,7 +288,30 @@ export default class TencentCOSUploaderPlugin extends Plugin {
 
         const token = new RunToken();
         this.activeRun = token;
-        const notice = new Notice('正在扫描图片…', 0);
+
+        // 注意：Notice 一旦 hide() 就不会再显示，所以预检弹窗之后必须重建一个。
+        // 手机端没有状态栏，Notice 是唯一的进度入口，不能指望 setStatusBar。
+        let notice = new Notice('正在扫描图片…', 0);
+        this.attachCancelButton(notice);
+
+        let watchdog: number | null = null;
+        let lastDoneAt = Date.now();
+        let lastRenderAt = 0;
+        const running = new Set<string>();
+        const counters = { done: 0, total: 0, success: 0, reused: 0, failed: 0 };
+
+        const render = (hint: string, force = false) => {
+            const now = Date.now();
+            if (!force && now - lastRenderAt < 150) return;
+            lastRenderAt = now;
+
+            const head = token.cancelled
+                ? `COS ${counters.done}/${counters.total} 正在取消…`
+                : `COS ${counters.done}/${counters.total}（成功 ${counters.success}，复用 ${counters.reused}，失败 ${counters.failed}）`;
+
+            this.setStatusBar(`${head} · 点击取消`);
+            notice.setMessage(`${head}\n${hint}`);
+        };
 
         try {
             const content = await this.app.vault.read(file);
@@ -267,49 +339,76 @@ export default class TencentCOSUploaderPlugin extends Plugin {
                     new Notice('已取消，笔记未做任何修改。');
                     return;
                 }
+                // 重新建一个 Notice：旧的已经被 hide()，setMessage 不会让它回来
+                notice = new Notice('准备上传…', 0);
+                this.attachCancelButton(notice);
             }
 
             const mapping = new Map<string, string>();
-            const total = collected.tasks.length;
-            let done = 0;
-            let success = 0;
-            let reused = 0;
-            let failed = 0;
+            counters.total = collected.tasks.length;
             const failures: string[] = [];
 
-            const updateProgress = (hint: string) => {
-                const base = `COS ${done}/${total}（成功 ${success}，复用 ${reused}，失败 ${failed}）`;
-                const line = token.cancelled ? `${base} 正在取消…` : `${base} · 点击取消`;
-                this.setStatusBar(line);
-                notice.setMessage(`${line}\n${hint}`);
-            };
+            // 卡住检测：30 秒没有新完成就把“正在处理哪张”顶到提示里
+            watchdog = window.setInterval(() => {
+                if (this.activeRun !== token) return;
+                const idle = Math.round((Date.now() - lastDoneAt) / 1000);
+                if (idle < 25) return;
+                const current = [...running].slice(0, 2).map((item) => shorten(item, 42)).join('、');
+                render(
+                    `已 ${idle} 秒没有新完成，正在处理: ${current || '（准备中）'}\n` +
+                        '如果卡太久，点提示里的“取消”或运行 Cancel 命令',
+                    true
+                );
+            }, 5000);
 
             this.setStatusBarCancellable(token);
-            updateProgress('准备中…');
+            render('准备中…', true);
 
             await runWithConcurrency(collected.tasks, this.settings.concurrency, token, async (task) => {
-                updateProgress(`处理: ${shorten(task.target, 48)}`);
+                const label = describeTarget(task);
+                running.add(label);
+                render(`处理: ${shorten(label, 48)}`, true);
+
+                // 每个任务一个子 AbortController：超时/取消时能真正掐断底层请求
+                const taskController = new AbortController();
+                const onTokenAbort = () => taskController.abort();
+                token.signal.addEventListener('abort', onTokenAbort, { once: true });
+
+                const startedAt = Date.now();
                 try {
                     const result = await withTaskTimeout(
-                        this.runTask(task, file, token),
+                        this.runTask(task, file, taskController.signal),
                         TASK_TIMEOUT_MS,
-                        token
+                        token,
+                        taskController
                     );
                     mapping.set(task.target, result.url);
-                    if (result.reused) reused++;
-                    else success++;
+                    if (result.reused) counters.reused++;
+                    else counters.success++;
+                    logInfo(`图片完成${result.reused ? '（复用已有）' : ''}`, {
+                        target: shorten(task.target, 100),
+                        ms: Date.now() - startedAt,
+                        url: result.url,
+                    });
                 } catch (error) {
                     if (token.cancelled && !mapping.has(task.target)) {
                         // 取消导致的失败不计入失败数
                         return;
                     }
-                    failed++;
+                    counters.failed++;
                     const message = error instanceof Error ? error.message : String(error);
                     failures.push(`${shorten(describeTarget(task), 60)} → ${message}`);
-                    console.error('[COS Uploader] 处理失败:', task.target.slice(0, 120), error);
+                    logError('图片处理失败', {
+                        target: shorten(task.target, 100),
+                        ms: Date.now() - startedAt,
+                        error: message,
+                    });
                 } finally {
-                    done++;
-                    updateProgress(`最近: ${shorten(describeTarget(task), 48)}`);
+                    token.signal.removeEventListener('abort', onTokenAbort);
+                    running.delete(label);
+                    counters.done++;
+                    lastDoneAt = Date.now();
+                    render(`最近: ${shorten(label, 48)}`);
                 }
             });
 
@@ -317,6 +416,10 @@ export default class TencentCOSUploaderPlugin extends Plugin {
                 await this.applyReplacements(file, mapping);
             }
 
+            if (watchdog !== null) {
+                window.clearInterval(watchdog);
+                watchdog = null;
+            }
             this.setStatusBar(null);
             notice.hide();
 
@@ -326,36 +429,44 @@ export default class TencentCOSUploaderPlugin extends Plugin {
             const skippedText = skippedParts.length ? `，${skippedParts.join('，')}` : '';
 
             if (token.cancelled) {
-                new Notice(
-                    `已取消：已替换 ${mapping.size} 张图片，其余保持原样${skippedText}。`,
-                    10000
-                );
+                new Notice(`已取消：已替换 ${mapping.size} 张图片，其余保持原样${skippedText}。`, 10000);
             } else if (failures.length === 0) {
                 new Notice(
-                    `完成：上传 ${success} 张${reused > 0 ? `，复用已有 ${reused} 张` : ''}${skippedText}。`
+                    `完成：上传 ${counters.success} 张${counters.reused > 0 ? `，复用已有 ${counters.reused} 张` : ''}${skippedText}。`
                 );
             } else {
                 new Notice(
-                    `完成：成功 ${success + reused} 张，失败 ${failed} 张${skippedText}。\n` +
+                    `完成：成功 ${counters.success + counters.reused} 张，失败 ${counters.failed} 张${skippedText}。\n` +
                         failures.slice(0, 3).join('\n') +
-                        (failures.length > 3 ? `\n…还有 ${failures.length - 3} 条，详见开发者控制台` : ''),
-                    12000
+                        `\n（完整日志：运行 “Export diagnostics log”）`,
+                    15000
                 );
-                console.warn('[COS Uploader] 全部失败详情:', failures);
+                logWarn('本轮失败清单', failures);
             }
         } catch (error) {
-            notice.hide();
             this.setStatusBar(null);
+            notice.hide();
             const message = error instanceof Error ? error.message : String(error);
-            new Notice(`上传过程出错：${message}`, 10000);
-            console.error('[COS Uploader] 上传过程出错:', error);
+            new Notice(`上传过程出错：${message}`, 12000);
+            logError('上传过程出错', error);
         } finally {
+            if (watchdog !== null) window.clearInterval(watchdog);
             this.activeRun = null;
         }
     }
 
-    /* ------------------------------------------------------------------ */
-    /* 任务收集                                                           */
+    /** 手机端没有状态栏，给 Notice 挂一个“取消”按钮（桌面端也有用） */
+    private attachCancelButton(notice: Notice): void {
+        const button = notice.noticeEl.createEl('button', { text: '取消' });
+        button.style.marginTop = '6px';
+        button.style.cursor = 'pointer';
+        button.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            this.cancelActiveRun();
+        });
+    }
+
     /* ------------------------------------------------------------------ */
 
     private collectTasks(content: string, includeRemote: boolean, articleReferer?: string) {
@@ -467,26 +578,30 @@ export default class TencentCOSUploaderPlugin extends Plugin {
     private async runTask(
         task: ImageTask,
         noteFile: TFile,
-        token: RunToken
+        signal: AbortSignal
     ): Promise<{ url: string; reused: boolean }> {
-        if (task.kind === 'inline') return this.handleInlineImage(task.target, token);
-        if (task.kind === 'local') return this.handleLocalImage(task.target, noteFile, token);
-        return this.handleRemoteImage(task.target, task.referer, token);
+        if (task.kind === 'inline') return this.handleInlineImage(task.target, signal);
+        if (task.kind === 'local') return this.handleLocalImage(task.target, noteFile, signal);
+        return this.handleRemoteImage(task.target, task.referer, signal);
     }
 
     private async handleRemoteImage(
         src: string,
         referer: string | undefined,
-        token: RunToken
+        signal: AbortSignal
     ): Promise<{ url: string; reused: boolean }> {
-        const download = await this.downloader.download(
-            src,
-            this.downloadOptions,
-            referer,
-            token.signal
-        );
+        const downloadStartedAt = Date.now();
+        const download = await this.downloader.download(src, this.downloadOptions, referer, signal);
         const fileName = fileNameFromUrl(download.finalUrl || src, download.ext);
 
+        logInfo('开始上传到 COS', {
+            file: fileName,
+            bytes: download.buffer.byteLength,
+            via: download.via,
+            downloadMs: Date.now() - downloadStartedAt,
+        });
+
+        const uploadStartedAt = Date.now();
         const result = await this.uploader.upload(
             {
                 buffer: download.buffer,
@@ -494,17 +609,21 @@ export default class TencentCOSUploaderPlugin extends Plugin {
                 fileName,
                 contentType: download.contentType,
             },
-            token.signal
+            signal
         );
+        logInfo('COS 上传完成', {
+            key: result.key,
+            skipped: result.skipped,
+            uploadMs: Date.now() - uploadStartedAt,
+        });
 
-        console.log(`[COS Uploader] 远程图片完成 (${download.via}): ${shorten(src, 50)} → ${result.url}`);
         return { url: result.url, reused: result.skipped };
     }
 
     private async handleLocalImage(
         src: string,
         noteFile: TFile,
-        token: RunToken
+        signal: AbortSignal
     ): Promise<{ url: string; reused: boolean }> {
         const imageFile = this.resolveLocalImage(src, noteFile);
         if (!imageFile) throw new Error('在库中找不到该图片文件');
@@ -519,14 +638,15 @@ export default class TencentCOSUploaderPlugin extends Plugin {
                 ext: imageFile.extension.toLowerCase(),
                 fileName: imageFile.name,
             },
-            token.signal
+            signal
         );
+        logInfo('本地图片上传完成', { file: imageFile.path, key: result.key, skipped: result.skipped });
         return { url: result.url, reused: result.skipped };
     }
 
     private async handleInlineImage(
         target: string,
-        token: RunToken
+        signal: AbortSignal
     ): Promise<{ url: string; reused: boolean }> {
         const decoded = decodeBase64ImageDataUri(target);
         if (!decoded) throw new Error('base64 内嵌图解码失败');
@@ -538,9 +658,9 @@ export default class TencentCOSUploaderPlugin extends Plugin {
                 contentType: decoded.mime,
                 fileName: `inline.${decoded.ext}`,
             },
-            token.signal
+            signal
         );
-        console.log(`[COS Uploader] 内嵌图完成: ${result.url}`);
+        logInfo('内嵌图上传完成', { key: result.key, skipped: result.skipped });
         return { url: result.url, reused: result.skipped };
     }
 
@@ -641,10 +761,10 @@ export default class TencentCOSUploaderPlugin extends Plugin {
             const legacyDir = path.resolve(basePath, manifestDir, '..', LEGACY_TEMP_DIR_NAME);
             if (fs.existsSync(legacyDir)) {
                 fs.rmSync(legacyDir, { recursive: true, force: true });
-                console.log('[COS Uploader] 已清理旧临时目录:', legacyDir);
+                logInfo('已清理旧临时目录', legacyDir);
             }
         } catch (error) {
-            console.warn('[COS Uploader] 清理旧临时目录失败:', error);
+            logWarn('清理旧临时目录失败', error);
         }
     }
 }
@@ -661,7 +781,12 @@ const TASK_TIMEOUT_MS = 180_000;
  * 底层请求本身已经有超时了，这里是最后一道保险：
  * 即使某个 Promise 永远不 settle，整轮上传也能结束，不会把插件锁死。
  */
-function withTaskTimeout<T>(promise: Promise<T>, timeoutMs: number, token: RunToken): Promise<T> {
+function withTaskTimeout<T>(
+    promise: Promise<T>,
+    timeoutMs: number,
+    token: RunToken,
+    controller: AbortController
+): Promise<T> {
     return new Promise<T>((resolve, reject) => {
         let settled = false;
 
@@ -677,10 +802,11 @@ function withTaskTimeout<T>(promise: Promise<T>, timeoutMs: number, token: RunTo
             else resolve(value as T);
         };
 
-        const timer = setTimeout(
-            () => finish(new Error(`处理超时（超过 ${Math.round(timeoutMs / 1000)} 秒）`)),
-            timeoutMs
-        );
+        const timer = setTimeout(() => {
+            // 关键：超时后真的掐断这一张的请求，而不是让它在后台继续挂着
+            controller.abort();
+            finish(new Error(`处理超时（超过 ${Math.round(timeoutMs / 1000)} 秒）`));
+        }, timeoutMs);
         const onAbort = () => finish(new Error('已取消'));
 
         if (token.cancelled) {

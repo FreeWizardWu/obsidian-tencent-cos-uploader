@@ -67,7 +67,14 @@ export class PreflightModal extends Modal {
         }
 
         contentEl.createEl('p', {
-            text: '开始后状态栏会显示进度，点击状态栏可随时取消；已完成的图片仍会被替换。',
+            text:
+                '开始后进度会显示在提示框里（手机端没有状态栏，也靠它看进度）；' +
+                '随时点提示框里的「取消」或运行 Cancel 命令都能中断，已完成的图片仍会被替换。',
+            cls: 'setting-item-description',
+        });
+
+        contentEl.createEl('p', {
+            text: '每张图片最多处理 60 秒（含重试与备用通道），不会无限等待；慢的图片会在进度里显示已耗时多久。',
             cls: 'setting-item-description',
         });
 

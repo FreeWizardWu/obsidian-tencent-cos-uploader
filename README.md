@@ -133,6 +133,11 @@ Node 的 `http` / `https` 模块**既不读 `http_proxy`、`https_proxy` 环境�
 - 桌面端仍保留 Node 直连 / HTTP 代理作为下载兜底，相关代码隔离在 `node-network.ts`，用动态 import 惰性加载，
   手机上永远不会执行到 `require('http')`。
 
+## 出问题了怎么排查？
+
+命令面板运行 **Export diagnostics log**：会把最近 800 条日志（每张图片的下载通道、耗时、COS 请求状态、失败原因）写到
+`<插件目录>/diagnostics.log`，并复制到剪贴板。手机端看不到开发者控制台，出问题时先导这个。
+
 ## 上传卡住 / 取消不掉怎么办？
 
 1.3.0 之前有一个真实的死锁场景：

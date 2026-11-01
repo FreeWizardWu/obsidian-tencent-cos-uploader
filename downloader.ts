@@ -18,13 +18,17 @@
 
 import { Platform, requestUrl } from 'obsidian';
 import { HttpStatusError } from './http-error';
+import { logInfo, logWarn } from './logger';
 import type { RawResponse } from './node-network';
 
 export interface DownloadOptions {
     userAgent: string;
     proxyUrl: string;
     referer: string;
+    /** 单次请求超时（毫秒） */
     timeoutMs: number;
+    /** 单张图片的总时长上限（毫秒，含所有重试与备用通道） */
+    budgetMs: number;
     retries: number;
     maxBytes: number;
     preferObsidianRequest: boolean;
@@ -216,38 +220,53 @@ export class ImageDownloader {
         const referer = fallbackReferer || options.referer || ImageDownloader.guessReferer(normalized);
         if (referer) headers.Referer = referer;
 
-        const strategies: Array<{ name: string; run: () => Promise<RawResponse> }> = [];
+        const strategies: Array<{ name: string; run: (timeoutMs: number) => Promise<RawResponse> }> = [];
 
         if (options.preferObsidianRequest) {
             strategies.push({
                 name: 'requestUrl',
-                run: () => this.requestUrlGet(normalized, headers, options.timeoutMs, options.maxBytes, signal),
+                run: (timeoutMs) => this.requestUrlGet(normalized, headers, timeoutMs, options.maxBytes, signal),
             });
         }
         if (options.proxyUrl && Platform.isDesktopApp) {
             strategies.push({
                 name: `node+proxy(${options.proxyUrl})`,
-                run: () => this.nodeGet(normalized, headers, options, true, signal),
+                run: (timeoutMs) => this.nodeGet(normalized, headers, options, true, signal, timeoutMs),
             });
         }
         // Node 直连只在桌面端可用；手机端只有 requestUrl 一条路
         if (Platform.isDesktopApp) {
             strategies.push({
                 name: 'node',
-                run: () => this.nodeGet(normalized, headers, options, false, signal),
+                run: (timeoutMs) => this.nodeGet(normalized, headers, options, false, signal, timeoutMs),
             });
         }
 
         const errors: string[] = [];
+        // 单张图片的总预算：避免一个域名挂了，拖着一整轮上传十分钟没反应
+        const deadline = Date.now() + Math.max(15000, options.budgetMs || options.timeoutMs * 2);
 
-        for (const strategy of strategies) {
+        outer: for (const strategy of strategies) {
             const attempts = Math.max(1, options.retries + 1);
             for (let attempt = 1; attempt <= attempts; attempt++) {
                 if (signal?.aborted) throw new Error('已取消');
 
+                const remaining = deadline - Date.now();
+                if (remaining < 1500) {
+                    errors.push(`[总超时] 单张图片处理超过 ${Math.round((options.budgetMs || 0) / 1000)} 秒`);
+                    break outer;
+                }
+                const attemptTimeout = Math.min(options.timeoutMs, remaining);
+
                 try {
-                    const raw = await strategy.run();
+                    const startedAt = Date.now();
+                    const raw = await strategy.run(attemptTimeout);
                     const ext = ImageDownloader.resolveExtension(raw.buffer, raw.contentType, normalized, options);
+                    logInfo(`下载成功（${strategy.name}）`, {
+                        url: shortened(normalized),
+                        ms: Date.now() - startedAt,
+                        bytes: raw.buffer.byteLength,
+                    });
                     return {
                         buffer: raw.buffer,
                         ext,
@@ -257,19 +276,24 @@ export class ImageDownloader {
                     };
                 } catch (error) {
                     const message = error instanceof Error ? error.message : String(error);
+                    if (message === '已取消' || signal?.aborted) throw new Error('已取消');
+
                     const retriable = isRetriableError(error);
                     if (attempt === attempts || !retriable) {
                         errors.push(`[${strategy.name}] ${message}`);
+                        logWarn(`下载失败（${strategy.name}）`, { url: shortened(normalized), error: message });
                         break;
                     }
 
                     // 429 / 503 优先遵守服务器给的 Retry-After
                     const retryAfter = error instanceof HttpStatusError ? error.retryAfterMs : undefined;
                     const delay = Math.min(retryAfter ?? 300 * attempt, 20_000);
-                    console.warn(
-                        `[COS Uploader] ${strategy.name} 第 ${attempt} 次失败（${message}），${delay}ms 后重试`
-                    );
-                    await sleep(delay);
+                    logWarn(`下载重试（${strategy.name} 第 ${attempt} 次）`, {
+                        url: shortened(normalized),
+                        error: message,
+                        delayMs: delay,
+                    });
+                    await sleep(Math.min(delay, Math.max(0, deadline - Date.now())));
                 }
             }
         }
@@ -325,7 +349,8 @@ export class ImageDownloader {
         headers: Record<string, string>,
         options: DownloadOptions,
         useProxy: boolean,
-        signal?: AbortSignal
+        signal?: AbortSignal,
+        timeoutOverride?: number
     ): Promise<RawResponse> {
         if (!Platform.isDesktopApp) {
             throw new Error('当前平台不支持 Node 网络请求（移动端只走 Obsidian 网络栈）');
@@ -337,7 +362,7 @@ export class ImageDownloader {
             headers,
             {
                 proxyUrl: useProxy ? options.proxyUrl : '',
-                timeoutMs: options.timeoutMs,
+                timeoutMs: timeoutOverride || options.timeoutMs,
                 maxBytes: options.maxBytes,
             },
             signal
@@ -438,6 +463,10 @@ function pickHeader(headers: Record<string, string>, name: string): string {
         if (key.toLowerCase() === lower) return headers[key];
     }
     return '';
+}
+
+function shortened(value: string, max = 80): string {
+    return value.length <= max ? value : `${value.slice(0, max - 1)}…`;
 }
 
 function isRetriableError(error: unknown): boolean {
