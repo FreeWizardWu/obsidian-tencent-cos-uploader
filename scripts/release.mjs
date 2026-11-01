@@ -106,14 +106,14 @@ run(`git push origin ${tag}`);
 
 /* ---------------------------- 4. 创建 Release ---------------------------- */
 
-const notes = `## ${version}
+const notes = `## 1.3.1
 
-- 支持桌面端与移动端（iOS / Android），不再依赖 Node 运行时
-- 上传走 COS REST API + TC3-HMAC-SHA256 自签名，请求经 Obsidian requestUrl 发出
-- 上传/下载全部带硬超时与取消，修复「卡住后一直提示上一次上传还没结束、且取消不掉」
-- 内容指纹改用纯 JS MD5，与旧版本生成的 key 完全一致，升级后不会重复上传
+### 变更
+- 设置页与 README 里的示例值改为通用示例（1250000000 / my-bucket-1250000000），不再使用真实 App ID 与桶名
+- 说明：设置页里灰色的 AKIDxxxx… 只是**占位提示**，不是已填内容；实际值只来自 data.json
 
-安装（BRAT）：BRAT → Add Beta Plugin → 填入本仓库路径。`;
+### 注意
+- 插件本体不包含任何密钥。手机端首次使用需自己填写 SecretId / SecretKey / Bucket / Region`;
 
 // 用文件传 notes，避免命令行转义把 \n 当成字面量
 const notesFile = path.join(outDir, 'RELEASE_NOTES.md');

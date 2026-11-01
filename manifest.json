@@ -1,7 +1,7 @@
 {
   "id": "obsidian-tencent-cos-uploader",
   "name": "Tencent COS Uploader",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "minAppVersion": "1.1.0",
   "description": "Upload local, remote, base64 and frontmatter images to Tencent Cloud COS and replace the links. Works on desktop and mobile. Proxy, hotlink protection, per-host rate limiting, cancellation and content de-duplication.",
   "author": "wumu2",

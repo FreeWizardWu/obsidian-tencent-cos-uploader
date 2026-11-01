@@ -41,7 +41,7 @@ export class TencentCOSUploaderSettingTab extends PluginSettingTab {
             .setDesc('腾讯云账号的 App ID（仅作备注，可不填）')
             .addText((text) =>
                 text
-                    .setPlaceholder('1318382287')
+                    .setPlaceholder('1250000000')
                     .setValue(this.plugin.settings.appId)
                     .onChange((value) => {
                         this.plugin.settings.appId = value.trim();
@@ -69,10 +69,10 @@ export class TencentCOSUploaderSettingTab extends PluginSettingTab {
 
         new Setting(containerEl)
             .setName('Bucket')
-            .setDesc('存储桶名称，形如 obsidian-1318382287')
+            .setDesc('存储桶名称，形如 obsidian-1250000000')
             .addText((text) =>
                 text
-                    .setPlaceholder('obsidian-1318382287')
+                    .setPlaceholder('obsidian-1250000000')
                     .setValue(this.plugin.settings.bucket)
                     .onChange((value) => {
                         this.plugin.settings.bucket = value.trim();

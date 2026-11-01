@@ -88,10 +88,10 @@ COS_SECRET_ID=... COS_SECRET_KEY=... COS_BUCKET=... COS_REGION=... npm run test:
 
 | 配置项 | 说明 | 示例 |
 |--------|------|------|
-| App ID | 腾讯云 App ID（仅备注） | 1318382287 |
+| App ID | 腾讯云 App ID（仅备注） | 1250000000 |
 | SecretId | 建议使用子账号密钥 | AKIDLXgmox... |
 | SecretKey | 密钥（明文本地保存，勿外泄） | JctIjR9qX... |
-| Bucket | 存储桶名称 | obsidian-1318382287 |
+| Bucket | 存储桶名称 | obsidian-1250000000 |
 | Region | 地域 | ap-guangzhou |
 | 路径前缀 | 对象 key 前缀 | picgo/ |
 | 自定义 CDN 域名 | 可选 | cdn.example.com |
@@ -178,9 +178,9 @@ Node 的 `http` / `https` 模块**既不读 `http_proxy`、`https_proxy` 环境�
 上传后：
 
 ```markdown
-![example](https://obsidian-1318382287.cos.ap-guangzhou.myqcloud.com/picgo/9f2c1a7be3d54a01.png)
-![截图](https://obsidian-1318382287.cos.ap-guangzhou.myqcloud.com/picgo/6b1d0c9a5e7f2a33.jpg)
-![](https://obsidian-1318382287.cos.ap-guangzhou.myqcloud.com/picgo/2ac7e5f10b9d3c48.png)
+![example](https://obsidian-1250000000.cos.ap-guangzhou.myqcloud.com/picgo/9f2c1a7be3d54a01.png)
+![截图](https://obsidian-1250000000.cos.ap-guangzhou.myqcloud.com/picgo/6b1d0c9a5e7f2a33.jpg)
+![](https://obsidian-1250000000.cos.ap-guangzhou.myqcloud.com/picgo/2ac7e5f10b9d3c48.png)
 ```
 
 ## 安全提示
