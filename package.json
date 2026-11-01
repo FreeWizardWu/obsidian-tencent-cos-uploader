@@ -1,6 +1,6 @@
 {
   "name": "obsidian-tencent-cos-uploader",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Obsidian plugin to upload images to Tencent Cloud COS and replace image links in markdown files",
   "main": "main.js",
   "scripts": {

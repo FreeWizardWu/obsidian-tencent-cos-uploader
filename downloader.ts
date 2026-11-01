@@ -50,11 +50,19 @@ export interface DownloadResult {
 /** 携带状态码与 Retry-After 的错误见 http-error.ts（桌面/移动两端共用） */
 
 /** 域名级并发限制：同一图床被打太多并发请求时很容易被限流 */
-class HostLimiter {
+/**
+ * 域名级并发限制。
+ *
+ * 注意这里的历史 bug（1.4.0 及之前）：release() 把名额「直接转交」给等待者时
+ * 不递减计数，而等待者被唤醒后又 +1，导致计数每次转交都漂移 +1。
+ * 第一批请求结束后计数会停在 limit 上，之后同一域名的新请求会永远等一个
+ * 永远不会到来的 release —— 表现为「前几张成功，后面彻底卡死」。
+ */
+export class HostLimiter {
     private readonly active = new Map<string, number>();
     private readonly waiting = new Map<string, Array<() => void>>();
 
-    async acquire(host: string, limit: number): Promise<() => void> {
+    async acquire(host: string, limit: number, signal?: AbortSignal): Promise<() => void> {
         if (!limit || limit <= 0) return () => undefined;
 
         const current = this.active.get(host) || 0;
@@ -63,13 +71,34 @@ class HostLimiter {
             return () => this.release(host);
         }
 
-        await new Promise<void>((resolve) => {
+        await new Promise<void>((resolve, reject) => {
             const queue = this.waiting.get(host) || [];
-            queue.push(resolve);
+            let settled = false;
+
+            const waiter = () => {
+                if (settled) return;
+                settled = true;
+                signal?.removeEventListener('abort', onAbort);
+                resolve();
+            };
+            const onAbort = () => {
+                if (settled) return;
+                settled = true;
+                const index = queue.indexOf(waiter);
+                if (index >= 0) queue.splice(index, 1);
+                if (queue.length === 0) this.waiting.delete(host);
+                reject(new Error('已取消'));
+            };
+
+            queue.push(waiter);
             this.waiting.set(host, queue);
+
+            if (signal?.aborted) onAbort();
+            else signal?.addEventListener('abort', onAbort, { once: true });
         });
 
-        this.active.set(host, (this.active.get(host) || 0) + 1);
+        // 名额是由 release() 直接转交过来的，计数已经在 release 里算好了，
+        // 这里绝对不能再 +1，否则计数会一路漂高并最终死锁。
         return () => this.release(host);
     }
 
@@ -77,13 +106,25 @@ class HostLimiter {
         const queue = this.waiting.get(host);
         const next = queue?.shift();
         if (next) {
-            // 直接把名额交给下一个等待者，active 保持不变
+            if (queue.length === 0) this.waiting.delete(host);
+            // 名额直接转交：active 保持不变，由等待者接手
             next();
             return;
         }
+
         const current = this.active.get(host) || 0;
         if (current <= 1) this.active.delete(host);
         else this.active.set(host, current - 1);
+    }
+
+    /** 仅用于测试：当前占用的名额数 */
+    activeCount(host: string): number {
+        return this.active.get(host) || 0;
+    }
+
+    /** 仅用于测试：还有多少个请求在排队 */
+    waitingCount(host: string): number {
+        return (this.waiting.get(host) || []).length;
     }
 }
 
@@ -143,6 +184,10 @@ const MIME_EXT: Record<string, string> = {
 
 export class ImageDownloader {
     private readonly hostLimiter = new HostLimiter();
+    /** 每个域名上一次成功的通道，后续同域名的图片直接走它，避免重复踩坑 */
+    private readonly hostStrategy = new Map<string, string>();
+    /** 这些域名上 requestUrl 已经证明不行，本次会话内直接跳过 */
+    private readonly requestUrlBlocked = new Set<string>();
 
     /** 规范化 URL：补全协议相对地址、转义未编码的非 ASCII 与空格 */
     static normalizeUrl(raw: string): string {
@@ -197,7 +242,7 @@ export class ImageDownloader {
                 return '';
             }
         })();
-        const release = await this.hostLimiter.acquire(host, options.perHostLimit);
+        const release = await this.hostLimiter.acquire(host, options.perHostLimit, signal);
 
         try {
             return await this.downloadWithRetry(normalized, options, fallbackReferer, signal);
@@ -220,34 +265,54 @@ export class ImageDownloader {
         const referer = fallbackReferer || options.referer || ImageDownloader.guessReferer(normalized);
         if (referer) headers.Referer = referer;
 
-        const strategies: Array<{ name: string; run: (timeoutMs: number) => Promise<RawResponse> }> = [];
+        const host = (() => {
+            try {
+                return new URL(normalized).hostname.toLowerCase();
+            } catch {
+                return '';
+            }
+        })();
 
-        if (options.preferObsidianRequest) {
-            strategies.push({
+        const proxyName = `node+proxy(${options.proxyUrl})`;
+        const all: Array<{ name: string; run: (timeoutMs: number) => Promise<RawResponse> }> = [];
+
+        if (options.preferObsidianRequest && !this.requestUrlBlocked.has(host)) {
+            all.push({
                 name: 'requestUrl',
                 run: (timeoutMs) => this.requestUrlGet(normalized, headers, timeoutMs, options.maxBytes, signal),
             });
         }
         if (options.proxyUrl && Platform.isDesktopApp) {
-            strategies.push({
-                name: `node+proxy(${options.proxyUrl})`,
+            all.push({
+                name: proxyName,
                 run: (timeoutMs) => this.nodeGet(normalized, headers, options, true, signal, timeoutMs),
             });
         }
         // Node 直连只在桌面端可用；手机端只有 requestUrl 一条路
         if (Platform.isDesktopApp) {
-            strategies.push({
+            all.push({
                 name: 'node',
                 run: (timeoutMs) => this.nodeGet(normalized, headers, options, false, signal, timeoutMs),
             });
         }
+
+        // 上次这个域名靠哪条通道成功，就先试它 —— 26 张 twitter 图片不该每张都重新踩一遍
+        const preferred = this.hostStrategy.get(host);
+        const strategies = preferred
+            ? [...all.filter((s) => s.name === preferred), ...all.filter((s) => s.name !== preferred)]
+            : all;
 
         const errors: string[] = [];
         // 单张图片的总预算：避免一个域名挂了，拖着一整轮上传十分钟没反应
         const deadline = Date.now() + Math.max(15000, options.budgetMs || options.timeoutMs * 2);
 
         outer: for (const strategy of strategies) {
-            const attempts = Math.max(1, options.retries + 1);
+            // requestUrl 在桌面端有备用通道，且它无法真正取消（超时后连接仍占着），
+            // 所以只试一次；失败就把这个域名标记为「不走 requestUrl」。
+            const attempts =
+                strategy.name === 'requestUrl' && Platform.isDesktopApp
+                    ? 1
+                    : Math.max(1, options.retries + 1);
             for (let attempt = 1; attempt <= attempts; attempt++) {
                 if (signal?.aborted) throw new Error('已取消');
 
@@ -262,6 +327,7 @@ export class ImageDownloader {
                     const startedAt = Date.now();
                     const raw = await strategy.run(attemptTimeout);
                     const ext = ImageDownloader.resolveExtension(raw.buffer, raw.contentType, normalized, options);
+                    this.hostStrategy.set(host, strategy.name);
                     logInfo(`下载成功（${strategy.name}）`, {
                         url: shortened(normalized),
                         ms: Date.now() - startedAt,
@@ -281,6 +347,7 @@ export class ImageDownloader {
                     const retriable = isRetriableError(error);
                     if (attempt === attempts || !retriable) {
                         errors.push(`[${strategy.name}] ${message}`);
+                        if (strategy.name === 'requestUrl') this.requestUrlBlocked.add(host);
                         logWarn(`下载失败（${strategy.name}）`, { url: shortened(normalized), error: message });
                         break;
                     }

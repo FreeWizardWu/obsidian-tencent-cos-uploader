@@ -50,7 +50,7 @@ const cosClient = await bundle('cos-client.ts', { obsidian: obsidianStub });
 const cosUploader = await bundle('cos-uploader.ts', { obsidian: obsidianStub });
 
 const { parseImageLinks, replaceImageTargets, isBase64ImageDataUri, decodeBase64ImageDataUri } = parser;
-const { ImageDownloader } = downloader;
+const { ImageDownloader, HostLimiter } = downloader;
 const { md5Hex, sha256Hex, hmacSha256Hex } = hash;
 const { signRequest, encodeKey, describeCosError } = cosClient;
 const { COSUploader } = cosUploader;
@@ -592,4 +592,111 @@ test('每个任务都有自己的 AbortController，超时能真正中断请求'
     assert.ok(/new AbortController\(\)/.test(source), '任务级 AbortController 丢失');
     assert.ok(/controller\.abort\(\)/.test(source), '超时后没有 abort 底层请求');
 });
+console.log('回归：域名并发限流死锁（1.4.0 卡死的根因）');
+
+await testAsync('HostLimiter 名额不会泄漏，第一批之后第 5 个请求不会卡死', async () => {
+    const limiter = new HostLimiter();
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    // 复刻真实场景：并发 4、单域名上限 2
+    await Promise.all(
+        [1, 2, 3, 4].map(async () => {
+            const release = await limiter.acquire('pbs.twimg.com', 2);
+            await sleep(10);
+            release();
+        })
+    );
+    assert.strictEqual(limiter.activeCount('pbs.twimg.com'), 0, '第一批结束后名额没有归还');
+    assert.strictEqual(limiter.waitingCount('pbs.twimg.com'), 0, '还有请求留在队列里');
+
+    // 关键：第一批之后再取名额，必须在有限时间内拿到
+    const outcome = await Promise.race([
+        limiter.acquire('pbs.twimg.com', 2).then((release) => {
+            release();
+            return 'ok';
+        }),
+        sleep(1000).then(() => 'deadlock'),
+    ]);
+    assert.strictEqual(outcome, 'ok', '第 5 个请求卡死了（名额计数泄漏）');
+});
+
+await testAsync('HostLimiter 并发不超过上限', async () => {
+    const limiter = new HostLimiter();
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+    let running = 0;
+    let maxRunning = 0;
+
+    await Promise.all(
+        Array.from({ length: 12 }, async () => {
+            const release = await limiter.acquire('example.com', 2);
+            running++;
+            maxRunning = Math.max(maxRunning, running);
+            await sleep(5);
+            running--;
+            release();
+        })
+    );
+
+    assert.ok(maxRunning <= 2, `并发超限: ${maxRunning}`);
+    assert.strictEqual(limiter.activeCount('example.com'), 0, '结束后名额没归还');
+});
+
+await testAsync('HostLimiter 排队时可以被取消，不会永久阻塞', async () => {
+    const limiter = new HostLimiter();
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+    const release1 = await limiter.acquire('slow.example', 1);
+    const controller = new AbortController();
+    const waiting = limiter.acquire('slow.example', 1, controller.signal);
+
+    setTimeout(() => controller.abort(), 30);
+    await assert.rejects(() => waiting, /已取消/);
+    release1();
+    assert.strictEqual(limiter.activeCount('slow.example'), 0);
+});
+
+console.log('域名级通道记忆');
+
+await testAsync('同一域名第一次失败后，后续图片不再重复试 requestUrl', async () => {
+    // requestUrl 永远失败；node 直连成功（用本地 http 服务模拟）
+    const { createServer } = await import('http');
+    const png = Buffer.from(
+        'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==',
+        'base64'
+    );
+    const server = createServer((req, res) => {
+        res.writeHead(200, { 'Content-Type': 'image/png' });
+        res.end(png);
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const port = server.address().port;
+    const url = `http://127.0.0.1:${port}/a.png`;
+
+    globalThis.__STUB_DESKTOP__ = true;
+    globalThis.__REQ_COUNT__ = 0;
+    try {
+        const downloaderInstance = new ImageDownloader();
+        const options = {
+            ...DOWNLOAD_OPTIONS,
+            proxyUrl: '',
+            preferObsidianRequest: true,
+            retries: 0,
+        };
+
+        const first = await downloaderInstance.download(url, options);
+        assert.strictEqual(first.via, 'node', 'requestUrl 失败后应该回退到 node');
+        const afterFirst = globalThis.__REQ_COUNT__;
+
+        await downloaderInstance.download(url, options);
+        await downloaderInstance.download(url, options);
+        assert.strictEqual(
+            globalThis.__REQ_COUNT__,
+            afterFirst,
+            `同一域名后续图片仍在重试 requestUrl（多了 ${globalThis.__REQ_COUNT__ - afterFirst} 次）`
+        );
+    } finally {
+        server.close();
+    }
+});
+
 console.log(`\n${passed} 项通过${process.exitCode ? '，存在失败项' : ''}`);
